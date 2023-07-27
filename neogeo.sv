@@ -211,6 +211,7 @@ assign HDMI_FREEZE = 0;
 
 wire [1:0] ar       = status[33:32];
 wire       vcrop_en = status[34];
+wire 	   turbo = status[43];
 wire [3:0] vcopt    = status[38:35];
 reg        en216p;
 reg  [4:0] voff;
@@ -261,7 +262,7 @@ video_freak video_freak
 // 0         1         2         3          4         5         6   
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXX              XXXXXX 
+// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXX             XXXXXX 
 
 `include "build_id.v"
 localparam CONF_STR = {
@@ -285,6 +286,7 @@ localparam CONF_STR = {
 	"O2,CD Type,CD,CDZ;",
 	"OM,BIOS,UniBIOS,Original;",
 	"O3,Video Mode,NTSC,PAL;",
+	"oB,Turbo,OFF,ON;",
 	"-;",
 	"o9A,Input,Joystick or Spinner,Joystick,Spinner,Mouse(Irr.Maze);",
 	"-;",
@@ -1227,6 +1229,7 @@ assign sdram_ready = sdram2_ready & sdram1_ready;
 
 neo_d0 D0(
 	.CLK(CLK_48M),
+	.TURBO(turbo),
 	.CLK_EN_24M_P(CLK_EN_24M_P),
 	.CLK_EN_24M_N(CLK_EN_24M_N),
 	.nRESET(nRESET), .nRESETP(nRESETP),
