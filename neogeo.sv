@@ -283,7 +283,6 @@ localparam CONF_STR = {
 	"H3oU,ADPCMA CH 6,ON,OFF;",
 	"H3-;",
 	"O1,System Type,Console(AES),Arcade(MVS);",
-	"O2,CD Type,CD,CDZ;",
 	"OM,BIOS,UniBIOS,Original;",
 	"O3,Video Mode,NTSC,PAL;",
 	"oB,Turbo,OFF,ON;",
@@ -295,6 +294,7 @@ localparam CONF_STR = {
 	"D4RC,Save Memory Card;",
 	"OO,Autosave,OFF,ON;",
 	"-;",
+	"O2,CD Type,CD,CDZ;",
 	"OTU,CD Speed,1x,2x,3x,4x;",
 	"OAB,CD Region,US,EU,JP,AS;",
 	"OF,CD lid,Closed,Opened;",
@@ -413,7 +413,10 @@ reg SYSTEM_TYPE, SYSTEM_CD_TYPE;
 
 reg nRESET;
 always @(posedge CLK_48M) begin
-	nRESET <= &TRASH_ADDR;
+	reg rst_n;
+
+	nRESET <= rst_n;
+	rst_n <= &TRASH_ADDR;
 	if(CLK_EN_24M_N && ~&TRASH_ADDR) TRASH_ADDR <= TRASH_ADDR + 1'b1;
 
 	if (status[0] | status[14] | buttons[1] | bk_loading | RESET) begin
@@ -606,8 +609,8 @@ wire [7:0] SDD_IN, SDD_OUT, Z80_SDD_OUT;
 wire [7:0] SDD_RD_C1;
 wire [15:0] SDA, Z80_SDA;
 wire nSDRD, nSDWR, nMREQ, nIORQ, nBUSAK;
-wire nZ80_SDRD, nZ80_SDWR, nZ80_MREQ;
-wire nZ80INT, nZ80NMI, nSDW, nSDZ80R, nSDZ80W, nSDZ80CLR;
+wire Z80_nSDRD, Z80_nSDWR, Z80_nMREQ;
+wire Z80_nINT, Z80_nNMI, nSDW, nSDZ80R, nSDZ80W, nSDZ80CLR;
 wire nSDROM, nSDMRD, nSDMWR, SDRD0, SDRD1, nZRAMCS;
 wire n2610CS, n2610RD, n2610WR;
 
@@ -673,7 +676,10 @@ parameter INDEX_CROMS = 64;
 
 wire video_mode = status[3];
 
-wire [3:0] cart_pchip = cfg[22:20];
+wire       ms5p_bank  = cfg[17];
+wire       xram       = cfg[18];
+wire       adpcma_ext = cfg[19];
+wire [2:0] cart_pchip = cfg[22:20];
 wire       use_pcm    = cfg[23];
 wire [1:0] cart_chip  = cfg[25:24]; // legacy option: 0 - none, 1 - PRO-CT0, 2 - Link MCU
 wire [1:0] cmc_chip   = cfg[27:26]; // type 1/2
@@ -1002,8 +1008,8 @@ always_ff @(posedge clk_sys) begin
 		end else begin
 			P2ROM_MASK <= P2ROM_MASK | P2ROM_MASK[26:1];
 			CROM_MASK  <= CROM_MASK  | CROM_MASK[26:1];
-			V1ROM_MASK <= V1ROM_MASK | V1ROM_MASK[26:1];
-			V2ROM_MASK <= V2ROM_MASK | V2ROM_MASK[26:1];
+			V1ROM_MASK <= adpcma_ext ? 27'h1FFFFFF : (V1ROM_MASK | V1ROM_MASK[26:1]);
+			V2ROM_MASK <= adpcma_ext ? 27'h0       : (V2ROM_MASK | V2ROM_MASK[26:1]);
 			MROM_MASK  <= MROM_MASK  | MROM_MASK[26:1];
 		end
 	end
@@ -1240,7 +1246,7 @@ neo_d0 D0(
 	.nBITWD0(nBITWD0),
 	.SDA_H(SDA[15:11]), .SDA_L(SDA[4:2]),
 	.nSDRD(nSDRD),	.nSDWR(nSDWR), .nMREQ(nMREQ),	.nIORQ(nIORQ),
-	.nZ80NMI(nZ80NMI),
+	.nZ80NMI(Z80_nNMI),
 	.nSDW(nSDW), .nSDZ80R(nSDZ80R), .nSDZ80W(nSDZ80W),	.nSDZ80CLR(nSDZ80CLR),
 	.nSDROM(nSDROM), .nSDMRD(nSDMRD), .nSDMWR(nSDMWR), .nZRAMCS(nZRAMCS),
 	.SDRD0(SDRD0),	.SDRD1(SDRD1),
@@ -1299,7 +1305,7 @@ assign FX68K_DATAIN = M68K_RW ? M68K_DATA_BYTE_MASK : 16'h0000;
 assign FIXD = CD_USE_FIX ? 8'bzzzz_zzzz : S2H1 ? SROM_DATA[15:8] : SROM_DATA[7:0];
 
 // Disable ROM read in PORT zone if the game uses a special chip
-assign M68K_DATA = (nROMOE & nSROMOE & ~CD_TR_RD_SPR & |{nPORTOE, cart_chip, cart_pchip, CD_TR_RD_FIX}) ? 16'bzzzzzzzzzzzzzzzz : PROM_DATA;
+assign M68K_DATA = (nROMOE & nSROMOE & ~CD_TR_RD_SPR & |{nPORTOE, cart_chip, cart_pchip, xram, CD_TR_RD_FIX}) ? 16'bzzzzzzzzzzzzzzzz : PROM_DATA;
 
 // Output correct FIX byte
 assign M68K_DATA[7:0] = ~CD_TR_RD_FIX ? 8'bzzzz_zzzz : (M68K_ADDR[4] ? PROM_DATA[15:8] : PROM_DATA[7:0]);
@@ -1374,6 +1380,42 @@ neo_sma neo_sma
 	.P2_ADDR(P2ROM_ADDR_SMA)
 );
 
+wire XRAM_CS = ~nPORTADRS && !M68K_ADDR[19:13] && xram;
+wire [15:0] XRAM_OUT;
+wire [15:0] xram_buff_dout;
+
+dpram #(12) XRAML(
+	.clock_a(CLK_48M),
+	.address_a(M68K_ADDR[12:1]),
+	.data_a(M68K_DATA[7:0]),
+	.wren_a(~nPORTWEL & XRAM_CS),
+	.q_a(XRAM_OUT[7:0]),
+
+	.clock_b(clk_sys),
+	.address_b(memcard_addr),
+	.wren_b(memcard_wr & xram),
+	.data_b(sd_buff_dout[7:0]),
+	.q_b(xram_buff_dout[7:0])
+);
+
+dpram #(12) XRAMU(
+	.clock_a(CLK_48M),
+	.address_a(M68K_ADDR[12:1]),
+	.data_a(M68K_DATA[15:8]),
+	.wren_a(~nPORTWEU & XRAM_CS),
+	.q_a(XRAM_OUT[15:8]),
+
+	.clock_b(clk_sys),
+	.address_b(memcard_addr),
+	.wren_b(memcard_wr & xram),
+	.data_b(sd_buff_dout[15:8]),
+	.q_b(xram_buff_dout[15:8])
+);
+
+assign M68K_DATA[7:0]  = (XRAM_CS & ~nPORTOEL) ? XRAM_OUT[7:0]  : 8'bZ;
+assign M68K_DATA[15:8] = (XRAM_CS & ~nPORTOEU) ? XRAM_OUT[15:8] : 8'bZ;
+
+assign M68K_DATA[7:0] = (~nPORTOEL && M68K_ADDR[19] && !M68K_ADDR[18:1] && xram) ? {~joystick_0[8],1'b1,~joystick_0[9],~joystick_0[11],2'b11, ~joystick_1[10],~joystick_0[10]} : 8'bZ;
 
 // Work RAM or CD extended RAM read
 assign M68K_DATA[7:0]  = nWRL ? 8'bzzzzzzzz : SYSTEM_CDx ? PROM_DATA[7:0]  : WRAML_OUT;
@@ -1427,7 +1469,7 @@ memcard MEMCARD(
 );
 
 // Feed save file writer with backup RAM data or memory card data
-wire [15:0] bk_dout = bk_lba[7] ? memcard_buff_dout : sram_buff_dout;
+wire [15:0] bk_dout = ~bk_lba[7] ? sram_buff_dout : xram ? xram_buff_dout : memcard_buff_dout;
 
 assign CROM_ADDR = {C_LATCH_EXT, C_LATCH, 3'b000} & CROM_MASK;
 
@@ -1446,10 +1488,11 @@ begin
 	reg nPORTWEL_d;
 	nPORTWEL_d <= nPORTWEL;
 
-	if (!nRESET)
-		P_BANK <= 0;
-	else if (nPORTWEL & ~nPORTWEL_d)
-		if (!SYSTEM_CDx) P_BANK <= M68K_DATA[3:0];
+	if (!nRESET || SYSTEM_CDx) P_BANK <= 0;
+	else if (~nPORTWEL & nPORTWEL_d) begin
+		if(~ms5p_bank) P_BANK <= M68K_DATA[3:0];
+		else if(&M68K_ADDR[19:4] && M68K_ADDR[3:1] == 2) P_BANK <= M68K_DATA[7:4] - 1'd1;
+	end
 end
 
 // PRO-CT0 used as security chip
@@ -1581,8 +1624,8 @@ neo_c1 C1(
 	.nLSPOE(nLSPOE), .nLSPWE(nLSPWE),
 	.nCRDO(nCRDO), .nCRDW(nCRDW), .nCRDC(nCRDC),
 	.nSDW(nSDW),
-	.P1_IN(~{(joystick_0[9:8]|ps2_mouse[2]), {use_mouse ? ms_pos : use_sp ? {|{joystick_0[7:4],ps2_mouse[1:0]},sp0} : {joystick_0[7:4]|{3{joystick_0[11]}}, joystick_0[0], joystick_0[1], joystick_0[2], joystick_0[3]}}}),
-	.P2_IN(~{ joystick_1[9:8],               {use_mouse ? ms_btn : use_sp ? {|{joystick_1[7:4]},               sp1} : {joystick_1[7:4]|{3{joystick_1[11]}}, joystick_1[0], joystick_1[1], joystick_1[2], joystick_1[3]}}}),
+	.P1_IN(~{(joystick_0[9:8]|ps2_mouse[2]), {use_mouse ? ms_pos : use_sp ? {|{joystick_0[7:4],ps2_mouse[1:0]},sp0} : {joystick_0[7:4]|{3{~xram & joystick_0[11]}}, joystick_0[0], joystick_0[1], joystick_0[2], joystick_0[3]}}}),
+	.P2_IN(~{ joystick_1[9:8],               {use_mouse ? ms_btn : use_sp ? {|{joystick_1[7:4]},               sp1} : {joystick_1[7:4]|{3{~xram & joystick_1[11]}}, joystick_1[0], joystick_1[1], joystick_1[2], joystick_1[3]}}}),
 	.nCD1(nCD1), .nCD2(nCD2),
 	.nWP(0),			// Memory card is never write-protected
 	.nROMWAIT(~rom_wait), .nPWAIT0(~p_wait[0]), .nPWAIT1(~p_wait[1]), .PDTACK(1),
@@ -1638,7 +1681,7 @@ always @(posedge clk_sys) begin
 	end
 end
 
-neo_zmc2 ZMC2(
+zmc2_dot ZMC2(
 	.CLK(CLK_48M),
 	.CLK_EN_12M_N(CLK_EN_12M_N),
 	.EVEN(EVEN1), .LOAD(LOAD), .H(H),
@@ -1696,7 +1739,7 @@ assign SDD_IN = (~nSDZ80R)             ? SDD_RD_C1 :
 					 8'b00000000;
 
 wire Z80_nRESET = SYSTEM_CDx ? nRESET & CD_nRESET_Z80 : nRESET;
-wire CD_HAS_Z80_BUS = (CD_USE_Z80 & ~(nBUSAK & Z80_nRESET));
+wire CD_HAS_Z80_BUS = (CD_USE_Z80 & ~(nBUSAK & CD_nRESET_Z80));
 
 wire [7:0] M1_ROM_DATA;
 reg z80rd_req;
@@ -1711,7 +1754,7 @@ always @(posedge DDRAM_CLK) begin
 	if(~old_rd1 & old_rd) z80rd_req <= ~z80rd_req;
 end
 
-wire nZ80WAIT = (z80rd_req == z80rd_ack);
+wire Z80_nWAIT = (z80rd_req == z80rd_ack);
 
 cpu_z80 Z80CPU(
 	.CLK(CLK_48M),
@@ -1719,19 +1762,19 @@ cpu_z80 Z80CPU(
 	.CLK4N_EN(CLK_EN_4M_N),
 	.nRESET(Z80_nRESET),
 	.SDA(Z80_SDA), .SDD_IN(SDD_IN), .SDD_OUT(Z80_SDD_OUT),
-	.nIORQ(nIORQ),	.nMREQ(nZ80_MREQ),	.nRD(nZ80_SDRD), .nWR(nZ80_SDWR),
+	.nIORQ(nIORQ),	.nMREQ(Z80_nMREQ), .nRD(Z80_nSDRD), .nWR(Z80_nSDWR),
 	.nBUSRQ(~CD_USE_Z80), .nBUSAK(nBUSAK),
-	.nINT(nZ80INT), .nNMI(nZ80NMI), .nWAIT(nZ80WAIT)
+	.nINT(Z80_nINT), .nNMI(Z80_nNMI), .nWAIT(Z80_nWAIT)
 );
 
 assign { SDA, SDD_OUT } = ~CD_HAS_Z80_BUS ? { Z80_SDA, Z80_SDD_OUT } : DMA_RUNNING ? { DMA_ADDR_OUT[16:1], DMA_DATA_OUT[7:0] } : { M68K_ADDR[16:1], M68K_DATA[7:0] };
-assign { nSDRD, nSDWR } = ~CD_HAS_Z80_BUS ? { nZ80_SDRD, nZ80_SDWR } : { ~CD_TR_RD_Z80, ~CD_TR_WR_Z80 };
-assign { nMREQ } = ~CD_HAS_Z80_BUS ? nZ80_MREQ : ~(CD_TR_RD_Z80 | CD_TR_WR_Z80);
+assign { nSDRD, nSDWR } = ~CD_HAS_Z80_BUS ? { Z80_nSDRD, Z80_nSDWR } : { ~CD_TR_RD_Z80, ~CD_TR_WR_Z80 };
+assign { nMREQ }        = ~CD_HAS_Z80_BUS ? { Z80_nMREQ            } : {~(CD_TR_RD_Z80 | CD_TR_WR_Z80)};
 
-assign M68K_DATA[7:0] = ~(CD_HAS_Z80_BUS & CD_TR_RD_Z80) ? 8'bzzzz_zzzz : (SDD_IN);
+assign M68K_DATA[7:0]   = ~(CD_HAS_Z80_BUS & CD_TR_RD_Z80) ? 8'bzzzz_zzzz : SDD_IN;
 
 wire [19:0] ADPCMA_ADDR;
-wire [3:0] ADPCMA_BANK;
+wire  [4:0] ADPCMA_BANK;
 wire [23:0] ADPCMB_ADDR;
 
 reg adpcm_wr, adpcm_rd;
@@ -1784,7 +1827,7 @@ assign DDRAM_CLK = CLK_96M;
 
 reg ADPCMA_READ_REQ, ADPCMB_READ_REQ;
 reg ADPCMA_READ_ACK, ADPCMB_READ_ACK;
-reg [23:0] ADPCMA_ADDR_LATCH;	// 16MB
+reg [24:0] ADPCMA_ADDR_LATCH;	// 16MB(32MB)
 reg [24:0] ADPCMB_ADDR_LATCH;	// 32MB
 reg [7:0] ADPCMA_ACK_COUNTER;
 reg [10:0] ADPCMB_ACK_COUNTER;
@@ -1802,7 +1845,7 @@ always @(posedge DDRAM_CLK) begin
 	// Trigger ADPCM A data read on nSDROE falling edge
 	if (ADPCMA_OE_SR == 2'b10 & ~CD_USE_PCM) begin
 		ADPCMA_READ_REQ <= ~ADPCMA_READ_REQ;
-		ADPCMA_ADDR_LATCH <= {ADPCMA_BANK, ADPCMA_ADDR} & V1ROM_MASK[23:0];
+		ADPCMA_ADDR_LATCH <= {ADPCMA_BANK, ADPCMA_ADDR} & V1ROM_MASK[24:0];
 		// Data is needed on one previous 8MHz clk before next 666KHz clock->(96MHz/666KHz = 144)-12-4=128
 		ADPCMA_ACK_COUNTER <= 8'd128;
 	end
@@ -1995,7 +2038,7 @@ jt10 YM2610(
 	.addr(SDA[1:0]),
 	.din(SDD_OUT), .dout(YM2610_DOUT),
 	.cs_n(n2610CS), .wr_n(n2610WR),
-	.irq_n(nZ80INT),
+	.irq_n(Z80_nINT),
 	.adpcma_addr(ADPCMA_ADDR), .adpcma_bank(ADPCMA_BANK), .adpcma_roe_n(nSDROE), .adpcma_data(adpcma_d),
 	.adpcmb_addr(ADPCMB_ADDR), .adpcmb_roe_n(nSDPOE), .adpcmb_data(SYSTEM_CDx ? 8'h08 : adpcmb_d),	// CD has no ADPCM-B
 	.snd_right(snd_right), .snd_left(snd_left), .snd_enable(~{4{dbg_menu}} | ~status[28:25]), .ch_enable(~status[62:57])
